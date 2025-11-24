@@ -3,20 +3,34 @@
 """
 train_fno2d.py
 
-Updated: adds AMP (mixed precision) training support, MAE loss, and evaluation outputs
-- Uses original CSV (processed_data_mean.csv) without modifying it.
-- Builds samples by (date x depth_slice) via interpolation (lon,lat,depth) -> uo,vo,so,thetao on a regular grid.
-- Model: strict FNO2d (spectral conv as in the paper).
-- Loss: MAE (L1).
-- Train/Test random split: 85% / 15% (deterministic given seed).
-- AMP: enabled with --fp16 (recommended for GPU). Default is enabled to suit RTX4060 Laptop (8GB).
-- Saves best model, a sample pred/target, and two CSVs:
-    - eval_per_var.csv -- columns: variable,mae,count  (order: so,thetao,uo,vo)
-    - eval_per_day.csv -- columns: date,mae_so,mae_thetao,mae_uo,mae_vo,mae_overall
+FNO2d training + evaluation script with optional AMP and explicit train/test CSV support.
 
-Run example for RTX4060 (recommended):
-  python train_fno2d.py --csv processed_data_mean.csv --nx 48 --ny 48 --nz 8 \
-      --epochs 120 --batch 4 --modes1 12 --modes2 12 --width 24 --device cuda --fp16
+This version includes a fallback for the case where the user provided explicit
+train/test CSVs but those CSVs were created by random row-wise splitting
+(i.e., many dates have too few points). In that case the script will automatically
+combine train+test CSVs, build samples by date+depth from the combined data, and
+then perform a random 80/20 sample-level split to produce train/test sets.
+
+CSV header supported (your format):
+  date,t_numeric,latitude,longitude,depth,so,thetao,uo,vo
+
+Modes:
+  1) Explicit train/test CSVs (preferred for fixed splits):
+     --train_csv processed_data_mean_train.csv --test_csv processed_data_mean_test.csv
+
+  2) Single CSV (legacy) with random 80/20 split:
+     --csv processed_data_mean.csv  (uses --test_frac, default 0.20)
+
+If explicit CSVs are provided but result in no test samples (e.g. because
+each date has too few points), the script will fall back to combined random-split mode.
+
+Recommended (RTX 4060 Laptop 8GB - conservative):
+  python train_fno2d.py --train_csv processed_data_mean_train.csv --test_csv processed_data_mean_test.csv \
+      --nx 48 --ny 48 --nz 8 --epochs 120 --batch 4 --modes1 12 --modes2 12 --width 24 --device cuda --fp16
+
+Quick evaluation-only (if you already have model saved):
+  python train_fno2d.py --train_csv processed_data_mean_train.csv --test_csv processed_data_mean_test.csv \
+      --nx 48 --ny 48 --nz 8 --epochs 0 --batch 1 --device cuda --save_model fno2d_ocean_amp.pth
 
 """
 import os
@@ -26,18 +40,19 @@ import numpy as np
 import pandas as pd
 from scipy.interpolate import griddata
 import random
+import sys
 
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader, Subset
 
-# IMPORTANT: use non-interactive matplotlib backend to avoid tkinter/Tcl errors on headless systems
+# Use non-interactive matplotlib backend to avoid tkinter/Tcl errors on headless systems
 import matplotlib
-matplotlib.use("Agg")  # <-- ensures no Tkinter/Tcl GUI required
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 # ---------------------------
-# FNO2d model
+# Model: SpectralConv2d + FNO2d
 # ---------------------------
 class SpectralConv2d(nn.Module):
     def __init__(self, in_channels, out_channels, modes1, modes2):
@@ -47,24 +62,21 @@ class SpectralConv2d(nn.Module):
         self.modes1 = modes1
         self.modes2 = modes2
         self.scale = 1.0 / (in_channels * out_channels)
-        # store real and imag parts as parameters
         self.weights_real = nn.Parameter(self.scale * torch.randn(in_channels, out_channels, modes1, modes2))
         self.weights_imag = nn.Parameter(self.scale * torch.randn(in_channels, out_channels, modes1, modes2))
 
     def forward(self, x):
-        # x: (batch, in_channels, nx, ny)
-        batchsize = x.shape[0]
-        nx = x.shape[2]
-        ny = x.shape[3]
-        x_ft = torch.fft.rfft2(x, dim=(-2, -1))  # complex tensor
-        out_ft = torch.zeros(batchsize, self.out_channels, x_ft.shape[-2], x_ft.shape[-1], dtype=x_ft.dtype, device=x.device)
+        # x: (batch, in_chan, nx, ny)
+        b, c, nx, ny = x.shape
+        x_ft = torch.fft.rfft2(x, dim=(-2, -1))  # complex tensor (b, c, nx, nyf)
+        out_ft = torch.zeros(b, self.out_channels, x_ft.shape[-2], x_ft.shape[-1],
+                             dtype=x_ft.dtype, device=x.device)
         kx = min(self.modes1, x_ft.shape[-2])
         ky = min(self.modes2, x_ft.shape[-1])
         if kx == 0 or ky == 0:
             return torch.fft.irfft2(out_ft, s=(nx, ny), dim=(-2, -1))
         w_complex = torch.complex(self.weights_real[:, :, :kx, :ky], self.weights_imag[:, :, :kx, :ky])  # (in,out,kx,ky)
         x_slice = x_ft[:, :, :kx, :ky]  # (b, in, kx, ky)
-        # multiply and sum over in_channels
         out_slice = torch.einsum('bixy,ioxy->boxy', x_slice, w_complex)  # (b, out, kx, ky)
         out_ft[:, :, :kx, :ky] = out_slice
         x = torch.fft.irfft2(out_ft, s=(nx, ny), dim=(-2, -1))
@@ -90,11 +102,7 @@ class FNO2d(nn.Module):
         self.act = nn.GELU()
 
     def forward(self, x):
-        # x: (batch, in_ch, nx, ny)
-        b = x.shape[0]
-        nx = x.shape[2]
-        ny = x.shape[3]
-        # lift
+        # x: (b, in_ch, nx, ny)
         x = x.permute(0, 2, 3, 1)  # (b, nx, ny, in_ch)
         x = self.fc0(x)
         x = x.permute(0, 3, 1, 2)  # (b, width, nx, ny)
@@ -116,59 +124,108 @@ class FNO2d(nn.Module):
         return x
 
 # ---------------------------
-# Data preprocessing (no file modification)
+# Data preprocessing utilities
 # ---------------------------
-def load_csv_make_samples(csv_path, nx=48, ny=48, nz=8, min_points=50):
+def compute_global_domain(csv_paths):
+    """Compute global lon/lat/depth bounds from list of CSV file paths."""
+    frames = []
+    for p in csv_paths:
+        if not os.path.exists(p):
+            # try look in script directory as fallback
+            alt = os.path.join(os.path.dirname(__file__), os.path.basename(p))
+            if os.path.exists(alt):
+                p = alt
+            else:
+                raise FileNotFoundError(f"CSV not found: {p}")
+        df = pd.read_csv(p)
+        frames.append(df)
+    df_all = pd.concat(frames, ignore_index=True)
+    # accept either 'longitude'/'latitude' naming
+    if 'longitude' in df_all.columns:
+        df_all['lon'] = df_all['longitude'].astype(float)
+    elif 'lon' in df_all.columns:
+        df_all['lon'] = df_all['lon'].astype(float)
+    else:
+        raise ValueError("No longitude column found in CSVs.")
+    if 'latitude' in df_all.columns:
+        df_all['lat'] = df_all['latitude'].astype(float)
+    elif 'lat' in df_all.columns:
+        df_all['lat'] = df_all['lat'].astype(float)
+    else:
+        raise ValueError("No latitude column found in CSVs.")
+    if 'depth' in df_all.columns:
+        df_all['depth_f'] = df_all['depth'].astype(float)
+    else:
+        raise ValueError("No depth column found in CSVs.")
+    lon_min, lon_max = df_all['lon'].min(), df_all['lon'].max()
+    lat_min, lat_max = df_all['lat'].min(), df_all['lat'].max()
+    depth_min, depth_max = df_all['depth_f'].min(), df_all['depth_f'].max()
+    return lon_min, lon_max, lat_min, lat_max, depth_min, depth_max
+
+def make_samples_from_df(df, lon_grid, lat_grid, depths_target, min_points=50):
     """
-    Read CSV, create samples by date and depth slices.
-    Returns:
-      samples: list of dict with keys inputs (4,nx,ny), targets (4,nx,ny), date (date), depth_level (float)
-      lon_grid, lat_grid, depths_target arrays
+    Given a dataframe and fixed grid/depths, generate samples (in-memory interpolation).
+    Returns list of sample dicts with keys 'inputs','targets','date','depth_level'.
     """
-    df = pd.read_csv(csv_path)
-    required = {'time', 'latitude', 'longitude', 'depth', 'uo', 'vo', 'so', 'thetao'}
-    if not required.issubset(set(df.columns)):
-        raise ValueError(f"CSV must contain columns: {required}. Found: {set(df.columns)}")
+    df = df.copy()
+    # determine date column: prefer 'date' if present, else 'time' or fallback to generated
+    if 'date' in df.columns:
+        df['date_parsed'] = pd.to_datetime(df['date']).dt.date
+    elif 'time' in df.columns:
+        df['date_parsed'] = pd.to_datetime(df['time']).dt.date
+    else:
+        # if no date-like column, create a pseudo-date grouping by integer division of row index to get slices
+        # but primary fallback is to let caller handle random splitting; here set each row's date as its index
+        df['date_parsed'] = pd.to_datetime(df.index).date
 
-    df['date'] = pd.to_datetime(df['time']).dt.date
-    df['lon'] = df['longitude'].astype(float)
-    df['lat'] = df['latitude'].astype(float)
-    df['depth'] = df['depth'].astype(float)
-    df['uo'] = df['uo'].astype(float)
-    df['vo'] = df['vo'].astype(float)
-    df['so'] = df['so'].astype(float)
-    df['thetao'] = df['thetao'].astype(float)
+    # ensure lon/lat/depth numeric columns exist (accept 'longitude'/'latitude' naming)
+    if 'longitude' in df.columns:
+        df['lon'] = df['longitude'].astype(float)
+    elif 'lon' in df.columns:
+        df['lon'] = df['lon'].astype(float)
+    else:
+        raise ValueError("No longitude-like column found in CSV.")
 
-    lon_min, lon_max = df['lon'].min(), df['lon'].max()
-    lat_min, lat_max = df['lat'].min(), df['lat'].max()
-    depth_min, depth_max = df['depth'].min(), df['depth'].max()
+    if 'latitude' in df.columns:
+        df['lat'] = df['latitude'].astype(float)
+    elif 'lat' in df.columns:
+        df['lat'] = df['lat'].astype(float)
+    else:
+        raise ValueError("No latitude-like column found in CSV.")
 
-    lon_grid = np.linspace(lon_min, lon_max, ny)
-    lat_grid = np.linspace(lat_min, lat_max, nx)
-    Lon, Lat = np.meshgrid(lon_grid, lat_grid)  # shapes (nx, ny)
+    if 'depth' in df.columns:
+        df['depth_f'] = df['depth'].astype(float)
+    else:
+        raise ValueError("No depth column found in CSV.")
 
-    unique_dates = sorted(df['date'].unique())
+    # ensure target variables exist
+    for col in ['uo', 'vo', 'so', 'thetao']:
+        if col not in df.columns:
+            raise ValueError(f"Missing required column '{col}' in CSV.")
+
+    unique_dates = sorted(df['date_parsed'].unique())
     if len(unique_dates) == 0:
-        raise RuntimeError("No dates found in CSV.")
+        return []
+
     t0 = unique_dates[0]
     max_days = max(1, (unique_dates[-1] - t0).days)
-    depths_target = np.linspace(depth_min, depth_max, nz)
-
+    Lon, Lat = np.meshgrid(lon_grid, lat_grid)
+    nx, ny = Lat.shape[0], Lon.shape[1]
     samples = []
     for d in unique_dates:
-        sdf = df[df['date'] == d]
+        sdf = df[df['date_parsed'] == d]
         if len(sdf) < min_points:
+            # skip date if too few raw points for robust interpolation
             continue
-        pts = np.vstack([sdf['lon'].values, sdf['lat'].values, sdf['depth'].values]).T
+        pts = np.vstack([sdf['lon'].values, sdf['lat'].values, sdf['depth_f'].values]).T
         vals_u = sdf['uo'].values
         vals_v = sdf['vo'].values
         vals_s = sdf['so'].values
         vals_th = sdf['thetao'].values
-
         t_scalar = (d - t0).days / max_days
+
         for depth_level in depths_target:
-            xi = np.stack([Lon.ravel(), Lat.ravel(), np.full(Lon.size, depth_level)], axis=-1)  # (nx*ny,3)
-            # linear interpolation, fallback to nearest for NaNs
+            xi = np.stack([Lon.ravel(), Lat.ravel(), np.full(Lon.size, depth_level)], axis=-1)
             u_grid = griddata(pts, vals_u, xi, method='linear')
             v_grid = griddata(pts, vals_v, xi, method='linear')
             s_grid = griddata(pts, vals_s, xi, method='linear')
@@ -191,12 +248,17 @@ def load_csv_make_samples(csv_path, nx=48, ny=48, nz=8, min_points=50):
                 s_grid = s_grid.reshape((nx, ny))
                 th_grid = th_grid.reshape((nx, ny))
             except Exception:
-                # skip if reshape fails
                 continue
 
-            # input channels: lon_norm, lat_norm, t_norm, depth_norm
+            # normalization channels (lon/lat -> [-1,1], t_norm in [0,1], depth_norm in [0,1])
+            lon_min = lon_grid.min()
+            lon_max = lon_grid.max()
+            lat_min = lat_grid.min()
+            lat_max = lat_grid.max()
             lon_norm = 2 * (Lon - lon_min) / max(1e-8, (lon_max - lon_min)) - 1.0
             lat_norm = 2 * (Lat - lat_min) / max(1e-8, (lat_max - lat_min)) - 1.0
+            depth_min = depths_target[0]
+            depth_max = depths_target[-1]
             depth_norm = (depth_level - depth_min) / max(1e-8, (depth_max - depth_min))
             t_norm = float(t_scalar)
 
@@ -210,10 +272,7 @@ def load_csv_make_samples(csv_path, nx=48, ny=48, nz=8, min_points=50):
                                 s_grid.astype(np.float32), th_grid.astype(np.float32)], axis=0)  # (4, nx, ny)
 
             samples.append({'inputs': inputs, 'targets': targets, 'date': d, 'depth_level': float(depth_level)})
-
-    if len(samples) == 0:
-        raise RuntimeError("No samples were generated. Check CSV content and min_points parameter.")
-    return samples, lon_grid, lat_grid, depths_target
+    return samples
 
 class OceanSliceDataset(Dataset):
     def __init__(self, samples):
@@ -224,14 +283,13 @@ class OceanSliceDataset(Dataset):
 
     def __getitem__(self, idx):
         s = self.samples[idx]
-        # convert arrays to torch tensors for efficient collation & transfer
         x = torch.from_numpy(s['inputs']).to(dtype=torch.float32)
         y = torch.from_numpy(s['targets']).to(dtype=torch.float32)
         meta = (str(s['date']), float(s['depth_level']))
         return x, y, meta
 
 # ---------------------------
-# Training & evaluation utilities
+# Train / Eval functions
 # ---------------------------
 def train_epoch(model, loader, opt, device, scaler=None):
     model.train()
@@ -260,16 +318,16 @@ def train_epoch(model, loader, opt, device, scaler=None):
 
 def evaluate_and_save(model, samples, test_indices, device, lon_grid, lat_grid, out_prefix="eval"):
     """
-    Evaluate model on test_indices (list of ints into samples).
-    Saves two CSVs: {out_prefix}_per_var.csv and {out_prefix}_per_day.csv
-    Returns (df_var, df_day)
+    Evaluate model on samples[test_indices] and save eval CSVs.
+    samples: list of sample dicts (with 'inputs','targets','date')
+    test_indices: list of indices into samples for evaluation
     """
     model.eval()
-    out_ch = 4  # order: [uo, vo, so, thetao] as stored in samples
+    out_ch = 4  # internal order [uo,vo,so,thetao]
     sum_abs = np.zeros(out_ch, dtype=np.float64)
-    total_grid_points_per_var = 0  # will be nx*ny * num_samples
-    per_day_sums = {}  # date_str -> np.array sum per var
-    per_day_counts = {}  # date_str -> int (number of grid points accumulated)
+    total_grid_points_per_var = 0
+    per_day_sums = {}
+    per_day_counts = {}
 
     nx = len(lat_grid)
     ny = len(lon_grid)
@@ -279,16 +337,14 @@ def evaluate_and_save(model, samples, test_indices, device, lon_grid, lat_grid, 
         for idx in test_indices:
             s = samples[idx]
             x_np = s['inputs']
-            y_np = s['targets']  # (4,nx,ny)
+            y_np = s['targets']
             date_str = str(s['date'])
-            # prepare tensor
             xb = torch.from_numpy(x_np[None, ...]).to(dtype=torch.float32, device=device)
-            pred = model(xb)  # (1,4,nx,ny)
+            pred = model(xb)
             pred_np = pred.cpu().numpy()[0]
-            abs_err = np.abs(pred_np - y_np)  # (4,nx,ny)
+            abs_err = np.abs(pred_np - y_np)
             sum_abs += abs_err.reshape(out_ch, -1).sum(axis=1)
             total_grid_points_per_var += per_sample_count
-
             if date_str not in per_day_sums:
                 per_day_sums[date_str] = np.zeros(out_ch, dtype=np.float64)
                 per_day_counts[date_str] = 0
@@ -298,13 +354,13 @@ def evaluate_and_save(model, samples, test_indices, device, lon_grid, lat_grid, 
     if total_grid_points_per_var == 0:
         raise RuntimeError("No test points evaluated.")
 
-    # compute MAEs for internal order [uo,vo,so,thetao]
+    # compute MAE in internal order [uo,vo,so,thetao]
     mae_uo = sum_abs[0] / total_grid_points_per_var
     mae_vo = sum_abs[1] / total_grid_points_per_var
     mae_so = sum_abs[2] / total_grid_points_per_var
     mae_thetao = sum_abs[3] / total_grid_points_per_var
 
-    # Save eval_per_var.csv in order so,thetao,uo,vo to match your existing outputs
+    # Save eval_per_var.csv in order so,thetao,uo,vo to match prior format
     var_rows = [
         ('so', float(mae_so), int(total_grid_points_per_var)),
         ('thetao', float(mae_thetao), int(total_grid_points_per_var)),
@@ -314,9 +370,8 @@ def evaluate_and_save(model, samples, test_indices, device, lon_grid, lat_grid, 
     df_var = pd.DataFrame(var_rows, columns=['variable', 'mae', 'count'])
     df_var.to_csv(f"{out_prefix}_per_var.csv", index=False)
 
-    # per-day MAE rows sorted by date ascending
+    # per-day CSV
     rows = []
-    # sort keys reliably
     def parse_date(s):
         try:
             return datetime.strptime(s, "%Y-%m-%d")
@@ -340,41 +395,89 @@ def evaluate_and_save(model, samples, test_indices, device, lon_grid, lat_grid, 
     return df_var, df_day
 
 # ---------------------------
-# Main entry
+# Main
 # ---------------------------
 def main(args):
-    # set seeds
+    # reproducibility
     np.random.seed(args.seed)
     random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    print("Loading CSV and generating samples (in-memory interpolation, no file changes)...")
-    samples, lon_grid, lat_grid, depths_target = load_csv_make_samples(
-        args.csv, nx=args.nx, ny=args.ny, nz=args.nz, min_points=args.min_points
-    )
-    print(f"Generated {len(samples)} samples (date x depth slice). Grid: {args.nx}x{args.ny}, depth slices: {len(depths_target)}")
+    # explicit mode if both train_csv and test_csv provided
+    if args.train_csv and args.test_csv:
+        print("Mode: explicit train/test CSVs")
+        print("Train CSV:", args.train_csv)
+        print("Test CSV :", args.test_csv)
+        # compute global domain from both to ensure consistent grid
+        try:
+            lon_min, lon_max, lat_min, lat_max, depth_min, depth_max = compute_global_domain([args.train_csv, args.test_csv])
+        except FileNotFoundError as e:
+            # try fallback to script dir already handled in compute_global_domain
+            raise
 
-    total = len(samples)
-    n_test = max(1, int(total * args.test_frac))
-    n_train = total - n_test
+        lon_grid = np.linspace(lon_min, lon_max, args.ny)
+        lat_grid = np.linspace(lat_min, lat_max, args.nx)
+        depths_target = np.linspace(depth_min, depth_max, args.nz)
 
-    # deterministic random permutation
-    perm = np.random.RandomState(seed=args.seed).permutation(total)
-    train_idx = perm[:n_train].tolist()
-    test_idx = perm[n_train:].tolist()
+        # load dataframes
+        df_train = pd.read_csv(args.train_csv)
+        df_test = pd.read_csv(args.test_csv)
 
-    train_set = Subset(OceanSliceDataset(samples), train_idx)
-    test_set = Subset(OceanSliceDataset(samples), test_idx)
+        # build samples from each CSV separately (this is the original explicit behavior)
+        train_samples = make_samples_from_df(df_train, lon_grid, lat_grid, depths_target, min_points=args.min_points)
+        test_samples = make_samples_from_df(df_test, lon_grid, lat_grid, depths_target, min_points=args.min_points)
 
-    train_loader = DataLoader(train_set, batch_size=args.batch, shuffle=True, drop_last=False,
-                              num_workers=0, pin_memory=True)
+        # If test_samples is empty (common when the CSVs are random row-wise splits),
+        # fall back to combined random-split mode: build samples from concatenated df and then randomly split samples.
+        if len(test_samples) == 0:
+            print("Warning: no test samples generated from test CSV (likely because per-date point counts < min_points).")
+            print("Falling back to combined random-split mode: building samples from train+test combined and performing a random 80/20 split of samples.")
+            df_combined = pd.concat([df_train, df_test], ignore_index=True)
+            # recompute domain using combined dataframe (already similar), but reuse lon_grid/lat_grid/depths_target
+            combined_samples = make_samples_from_df(df_combined, lon_grid, lat_grid, depths_target, min_points= max(1, args.min_points//2))
+            if len(combined_samples) == 0:
+                raise RuntimeError("Fallback combined sample generation failed - no samples created. Consider lowering --min_points further.")
+            print(f"Combined samples created: {len(combined_samples)}. Now performing random 80/20 split.")
+            total = len(combined_samples)
+            n_test = max(1, int(total * 0.20))  # 80/20 fixed split for fallback mode
+            n_train = total - n_test
+            perm = np.random.RandomState(seed=args.seed).permutation(total)
+            train_idx = perm[:n_train].tolist()
+            test_idx = perm[n_train:].tolist()
+            train_samples = [combined_samples[i] for i in train_idx]
+            test_samples = [combined_samples[i] for i in test_idx]
+            print(f"Fallback split: train {len(train_samples)} samples, test {len(test_samples)} samples.")
+        else:
+            print(f"Train samples: {len(train_samples)}, Test samples: {len(test_samples)}")
 
+        # create DataLoader for training from train_samples
+        train_dataset = OceanSliceDataset(train_samples)
+        train_loader = DataLoader(train_dataset, batch_size=args.batch, shuffle=True, drop_last=False, num_workers=0, pin_memory=True)
+
+        samples_for_eval = test_samples
+        test_indices = list(range(len(test_samples)))
+
+    else:
+        # legacy single CSV mode with random split (default 80/20)
+        print("Mode: single CSV with random split (legacy). CSV:", args.csv)
+        samples, lon_grid, lat_grid, depths_target = make_samples_legacy(args.csv, nx=args.nx, ny=args.ny, nz=args.nz, min_points=args.min_points)
+        total = len(samples)
+        if total == 0:
+            raise RuntimeError("No samples generated from CSV.")
+        n_test = max(1, int(total * args.test_frac))
+        n_train = total - n_test
+        perm = np.random.RandomState(seed=args.seed).permutation(total)
+        train_idx = perm[:n_train].tolist()
+        test_idx = perm[n_train:].tolist()
+        print(f"Total samples: {total}. Train: {len(train_idx)}, Test: {len(test_idx)}")
+        train_loader = DataLoader(Subset(OceanSliceDataset(samples), train_idx), batch_size=args.batch, shuffle=True, drop_last=False, num_workers=0, pin_memory=True)
+        samples_for_eval = samples
+        test_indices = test_idx
+
+    # build model and optimizer
     device = torch.device(args.device if (args.device == 'cpu' or torch.cuda.is_available()) else 'cpu')
     print("Using device:", device)
-
-    model = FNO2d(in_channels=4, out_channels=4, modes1=args.modes1, modes2=args.modes2, width=args.width)
-    model = model.to(device)
-
+    model = FNO2d(in_channels=4, out_channels=4, modes1=args.modes1, modes2=args.modes2, width=args.width).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-8)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=args.lr_step, gamma=args.lr_gamma)
     scaler = torch.cuda.amp.GradScaler() if (args.fp16 and device.type == 'cuda') else None
@@ -382,35 +485,41 @@ def main(args):
     best_overall = 1e9
     best_epoch = -1
 
-    for ep in range(args.epochs):
-        train_loss = train_epoch(model, train_loader, optimizer, device, scaler=scaler)
-        scheduler.step()
+    # training loop (skip if epochs == 0)
+    if args.epochs > 0:
+        for ep in range(args.epochs):
+            train_loss = train_epoch(model, train_loader, optimizer, device, scaler=scaler)
+            scheduler.step()
+            if (ep % args.eval_every == 0) or (ep == args.epochs - 1):
+                print(f"Epoch {ep+1}/{args.epochs} train_loss={train_loss:.6e} -> running full test eval...")
+                df_var, df_day = evaluate_and_save(model, samples_for_eval, test_indices, device, lon_grid, lat_grid, out_prefix="temp_eval")
+                overall_mae = float(df_var['mae'].mean())
+                if overall_mae < best_overall:
+                    best_overall = overall_mae
+                    best_epoch = ep
+                    torch.save(model.state_dict(), args.save_model)
+                print(f"  temp eval overall MAE={overall_mae:.6e} best={best_overall:.6e} (epoch {best_epoch})")
+            else:
+                print(f"Epoch {ep+1}/{args.epochs} train_loss={train_loss:.6e}")
+    else:
+        print("Skipping training (epochs=0).")
 
-        if (ep % args.eval_every == 0) or (ep == args.epochs - 1):
-            print(f"Epoch {ep+1}/{args.epochs} train_loss={train_loss:.6e} -> running full test eval...")
-            df_var, df_day = evaluate_and_save(model, samples, test_idx, device, lon_grid, lat_grid, out_prefix="temp_eval")
-            # overall is mean across variables in df_var
-            overall_mae = float(df_var['mae'].mean())
-            if overall_mae < best_overall:
-                best_overall = overall_mae
-                best_epoch = ep
-                torch.save(model.state_dict(), args.save_model)
-            print(f"  temp eval overall MAE={overall_mae:.6e} best={best_overall:.6e} (epoch {best_epoch})")
-        else:
-            print(f"Epoch {ep+1}/{args.epochs} train_loss={train_loss:.6e}")
+    # load best model if available, otherwise use current model
+    if os.path.exists(args.save_model):
+        print("Loading model from", args.save_model)
+        model.load_state_dict(torch.load(args.save_model, map_location=device))
+        model.to(device).eval()
+    else:
+        print("Warning: saved model not found at", args.save_model, "- using current model weights for evaluation")
 
-    print("Training completed. Best overall MAE:", best_overall, "at epoch", best_epoch)
-    print("Loading best model and doing final evaluation...")
-    model.load_state_dict(torch.load(args.save_model, map_location=device))
-    model.to(device).eval()
+    # final eval and saving
+    df_var, df_day = evaluate_and_save(model, samples_for_eval, test_indices, device, lon_grid, lat_grid, out_prefix="eval")
 
-    df_var, df_day = evaluate_and_save(model, samples, test_idx, device, lon_grid, lat_grid, out_prefix="eval")
-
-    # Save a first test sample pred/target for quick inspection
-    idx0 = test_idx[0]
-    sample0 = samples[idx0]
-    x0 = sample0['inputs']
-    y0 = sample0['targets']
+    # save example sample outputs (first test sample)
+    ex_idx = test_indices[0]
+    ex_sample = samples_for_eval[ex_idx]
+    x0 = ex_sample['inputs']
+    y0 = ex_sample['targets']
     xb = torch.from_numpy(x0[None, ...]).to(dtype=torch.float32, device=device)
     with torch.no_grad():
         pred0 = model(xb).cpu().numpy()[0]
@@ -419,7 +528,7 @@ def main(args):
     np.save("sample_pred.npy", pred0)
     print("Saved sample_input.npy, sample_target.npy, sample_pred.npy")
 
-    # produce quick figure for uo target vs pred
+    # example plot (protected)
     try:
         Lon, Lat = np.meshgrid(lon_grid, lat_grid)
         targ_u = y0[0]
@@ -438,17 +547,50 @@ def main(args):
         print("Saved example_uo_pred.png")
     except Exception as e:
         print("Warning: plotting failed (non-fatal). Error:", str(e))
-        # still continue; sample numpy saved above
 
     print("Saved CSVs: eval_per_var.csv and eval_per_day.csv")
+    return
+
+# Legacy helper (kept for compatibility)
+def make_samples_legacy(csv_path, nx=48, ny=48, nz=8, min_points=50):
+    """Old mode: build grid and samples from a single CSV (kept for backward compatibility)."""
+    if not os.path.exists(csv_path):
+        # fallback to script dir
+        alt = os.path.join(os.path.dirname(__file__), os.path.basename(csv_path))
+        if os.path.exists(alt):
+            csv_path = alt
+        else:
+            raise FileNotFoundError(f"CSV not found: {csv_path}")
+    df = pd.read_csv(csv_path)
+    # handle potential 'date' column or 'time' column as used earlier
+    if 'date' in df.columns:
+        df['date_parsed'] = pd.to_datetime(df['date']).dt.date
+    elif 'time' in df.columns:
+        df['date_parsed'] = pd.to_datetime(df['time']).dt.date
+    else:
+        df['date_parsed'] = pd.to_datetime(df.index).date
+
+    df['lon'] = df['longitude'].astype(float) if 'longitude' in df.columns else df['lon'].astype(float)
+    df['lat'] = df['latitude'].astype(float) if 'latitude' in df.columns else df['lat'].astype(float)
+    df['depth_f'] = df['depth'].astype(float)
+    lon_min, lon_max = df['lon'].min(), df['lon'].max()
+    lat_min, lat_max = df['lat'].min(), df['lat'].max()
+    depth_min, depth_max = df['depth_f'].min(), df['depth_f'].max()
+    lon_grid = np.linspace(lon_min, lon_max, ny)
+    lat_grid = np.linspace(lat_min, lat_max, nx)
+    depths_target = np.linspace(depth_min, depth_max, nz)
+    samples = make_samples_from_df(df, lon_grid, lat_grid, depths_target, min_points=min_points)
+    return samples, lon_grid, lat_grid, depths_target
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--csv", type=str, default="processed_data_mean.csv", help="Original CSV input (do not modify).")
+    parser.add_argument("--csv", type=str, default="processed_data_mean.csv", help="Single CSV input (legacy random-split mode).")
+    parser.add_argument("--train_csv", type=str, default="", help="Explicit train CSV (use with --test_csv for fixed split).")
+    parser.add_argument("--test_csv", type=str, default="", help="Explicit test CSV (use with --train_csv for fixed split).")
     parser.add_argument("--nx", type=int, default=48, help="Grid rows (lat)")
     parser.add_argument("--ny", type=int, default=48, help="Grid cols (lon)")
     parser.add_argument("--nz", type=int, default=8, help="Number of depth slices per date")
-    parser.add_argument("--min_points", type=int, default=50, help="Min points required in a date to use it")
+    parser.add_argument("--min_points", type=int, default=50, help="Minimum raw points per date to use that date")
     parser.add_argument("--batch", type=int, default=4, help="Training batch size (lower if OOM)")
     parser.add_argument("--epochs", type=int, default=120)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -457,10 +599,10 @@ if __name__ == "__main__":
     parser.add_argument("--width", type=int, default=24)
     parser.add_argument("--lr_step", type=int, default=40)
     parser.add_argument("--lr_gamma", type=float, default=0.5)
-    parser.add_argument("--test_frac", type=float, default=0.15, help="Test fraction (0..1)")
+    parser.add_argument("--test_frac", type=float, default=0.20, help="Test fraction for legacy single-csv split (default 0.20 = 80/20)")
     parser.add_argument("--device", type=str, default="cuda", help="cuda or cpu")
     parser.add_argument("--save_model", type=str, default="fno2d_ocean_amp.pth")
-    parser.add_argument("--fp16", action="store_true", default=True, help="Enable AMP mixed precision (recommended for GPU)")
+    parser.add_argument("--fp16", action="store_true", default=False, help="Enable AMP mixed precision (use --fp16 to enable on GPU)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--eval_every", type=int, default=10, help="Full-test eval frequency (epochs)")
     args = parser.parse_args()
